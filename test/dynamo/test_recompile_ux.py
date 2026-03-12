@@ -321,6 +321,81 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(res, inp + 3)
 
 
+class PerFunctionCacheLimitTests(torch._dynamo.test_case.TestCase):
+    def test_cache_limit_basic(self):
+        cnt = torch._dynamo.testing.CompileCounter()
+
+        @torch.compile(backend=cnt, cache_limit=2)
+        def f(x, y):
+            return x + y
+
+        # Each call with a different dtype triggers recompilation
+        f(torch.randn(3), torch.randn(3))
+        self.assertEqual(cnt.frame_count, 1)
+
+        f(torch.randn(3, dtype=torch.float64), torch.randn(3, dtype=torch.float64))
+        self.assertEqual(cnt.frame_count, 2)
+
+        # Third dtype should NOT trigger recompilation (cache_limit=2 reached)
+        f(torch.randn(3, dtype=torch.float16), torch.randn(3, dtype=torch.float16))
+        self.assertEqual(cnt.frame_count, 2)
+
+    def test_cache_limit_independent_per_function(self):
+        cnt_f = torch._dynamo.testing.CompileCounter()
+        cnt_g = torch._dynamo.testing.CompileCounter()
+
+        @torch.compile(backend=cnt_f, cache_limit=1)
+        def f(x):
+            return x + 1
+
+        @torch.compile(backend=cnt_g, cache_limit=3)
+        def g(x):
+            return x * 2
+
+        f(torch.randn(3))
+        self.assertEqual(cnt_f.frame_count, 1)
+
+        # f should stop recompiling after 1
+        f(torch.randn(3, dtype=torch.float64))
+        self.assertEqual(cnt_f.frame_count, 1)
+
+        # g should allow up to 3
+        g(torch.randn(3))
+        g(torch.randn(3, dtype=torch.float64))
+        g(torch.randn(3, dtype=torch.float16))
+        self.assertEqual(cnt_g.frame_count, 3)
+
+        # g should stop at 3
+        g(torch.randn(3, dtype=torch.bfloat16))
+        self.assertEqual(cnt_g.frame_count, 3)
+
+    def test_cache_limit_none_uses_global(self):
+        cnt = torch._dynamo.testing.CompileCounter()
+
+        @torch.compile(backend=cnt)
+        def f(x, y):
+            return x + y
+
+        # Without cache_limit, should use global recompile_limit (default 8)
+        for i in range(10):
+            dtype = [
+                torch.float32,
+                torch.float64,
+                torch.float16,
+                torch.bfloat16,
+                torch.int32,
+                torch.int64,
+                torch.int16,
+                torch.int8,
+                torch.uint8,
+                torch.complex64,
+            ][i]
+            f(torch.ones(3, dtype=dtype), torch.ones(3, dtype=dtype))
+
+        # Should have compiled up to the global recompile_limit
+        self.assertEqual(cnt.frame_count, torch._dynamo.config.recompile_limit)
+
+
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
 

@@ -745,6 +745,7 @@ class _TorchDynamoContext:
         compiler_config: Any | None = None,
         package: CompilePackage | None = None,
         hooks: Hooks | None = None,
+        cache_limit: int | None = None,
     ) -> None:
         super().__init__()
         assert callable(callback) or callback is False or callback is None
@@ -761,6 +762,7 @@ class _TorchDynamoContext:
         self.enter_exit_hooks = []
         self._package = package
         self._hooks = hooks
+        self._cache_limit = cache_limit
         patch_fn()
 
         # Save the backends so that we can reset them during torch._dynamo.reset
@@ -1138,6 +1140,7 @@ class OptimizeContext(_TorchDynamoContext):
         rebuild_ctx: Callable[[], OptimizeContext | _NullDecorator] | None = None,
         package: CompilePackage | None = None,
         hooks: Hooks | None = None,
+        cache_limit: int | None = None,
     ) -> None:
         def on_enter() -> None:
             install_generation_tagging_init()
@@ -1155,6 +1158,7 @@ class OptimizeContext(_TorchDynamoContext):
             compiler_config=compiler_config,
             package=package,
             hooks=hooks,
+            cache_limit=cache_limit,
         )
 
         if config.compiled_autograd:
@@ -1306,6 +1310,7 @@ def _optimize_catch_errors(
     compiler_config: Any | None = None,
     rebuild_ctx: Callable[[], OptimizeContext | _NullDecorator] | None = None,
     package: CompilePackage | None = None,
+    cache_limit: int | None = None,
 ) -> OptimizeContext:
     return OptimizeContext(
         convert_frame.catch_errors_wrapper(compile_fn, hooks),
@@ -1319,6 +1324,7 @@ def _optimize_catch_errors(
         rebuild_ctx=rebuild_ctx,
         package=package,
         hooks=hooks,
+        cache_limit=cache_limit,
     )
 
 
@@ -1504,6 +1510,7 @@ def _optimize(
     disable: bool = False,
     dynamic: bool | None = None,
     package: CompilePackage | None = None,
+    cache_limit: int | None = None,
 ) -> OptimizeContext | _NullDecorator:
     """
     The main entrypoint of TorchDynamo.  Do graph capture and call
@@ -1562,6 +1569,7 @@ def _optimize(
             hooks=hooks,
             rebuild_ctx=rebuild_ctx,
             package=package,
+            cache_limit=cache_limit,
         )
 
     backend = get_compiler_fn(backend)
@@ -1585,6 +1593,7 @@ def _optimize(
             backend,
             hooks,
             package=package,
+            cache_limit=cache_limit,
         ),
         hooks,
         backend_ctx_ctor,
@@ -1599,6 +1608,7 @@ def _optimize(
         ),
         rebuild_ctx=rebuild_ctx,
         package=package,
+        cache_limit=cache_limit,
     )
 
 
@@ -2437,6 +2447,7 @@ def _optimize_assert(
     export_constraints: Any | None = None,
     dynamic: bool | None = None,
     package: CompilePackage | None = None,
+    cache_limit: int | None = None,
 ) -> OptimizeContext:
     """
     Guarantees single-graph capture.
@@ -2467,6 +2478,7 @@ def _optimize_assert(
             export=export,
             export_constraints=export_constraints,
             package=package,
+            cache_limit=cache_limit,
         ),
         hooks,
         backend_ctx_ctor,
@@ -2475,6 +2487,7 @@ def _optimize_assert(
         dynamic=dynamic,
         rebuild_ctx=rebuild_ctx,
         package=package,
+        cache_limit=cache_limit,
     )
 
 
