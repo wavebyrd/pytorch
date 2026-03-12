@@ -207,6 +207,17 @@ def initialize_cuda_context_rng():
 
 
 @contextlib.contextmanager
+def caching_allocator_disabled():
+    """Temporarily disable the CUDA caching allocator to detect IMA errors."""
+    prev = torch._C._cuda_cudaCachingAllocator_is_enabled()
+    torch.cuda.caching_allocator_enable(False)
+    try:
+        yield
+    finally:
+        torch.cuda.caching_allocator_enable(prev)
+
+
+@contextlib.contextmanager
 def tf32_off():
     old_allow_tf32_matmul = torch.backends.cuda.matmul.allow_tf32
     try:
