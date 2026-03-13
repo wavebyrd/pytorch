@@ -10,7 +10,6 @@
 #include <torch/csrc/distributed/c10d/cuda/utils.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemory-inl.cuh>
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryUtils.hpp>
-#include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryTypes.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/NCCLSymmetricMemory.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_manager.hpp>
 
@@ -168,6 +167,8 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
         group->getBackend(c10::DeviceType::CUDA).get());
     TORCH_CHECK(ncclPg != nullptr, "backend must be a NCCL process group");
     ncclComm_t comm = reinterpret_cast<ncclComm_t>(ncclPg->getCommPtr());
+    auto& manager = NCCLDevCommManager::get(c10::Device(c10::DeviceType::CUDA, device_idx_));
+    manager.register_comm(group_name_, comm);
 
     C10D_NCCL_CHECK(
       ncclCommWindowRegister(comm, allocation->ptr, buffer_size_, &buffer_win_, NCCL_WIN_COLL_SYMMETRIC),
@@ -195,11 +196,6 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
 
     // Starting from NCCL 2.28, we can use device communicators and get peer pointers
 #ifdef NCCL_HAS_SYMMEM_DEVICE_SUPPORT
-    // Create NCCL device communicator if it doesn't exist. Skip if it already exists.
-    auto& mr = NCCLDevCommManager::get(c10::Device(c10::DeviceType::CUDA, device_idx_));
-    // Each CTA will need a separate barrier. Assume `symm_max_nblocks` as a starting point.
-    mr.try_emplace_devcomm(group_name_, comm, /*LSA*/ symm_max_nblocks, /*GIN*/ symm_max_nblocks);
-
     const size_t arr_size = sizeof(void*) * world_size_;
     buffers_dev_ = reinterpret_cast<void**>(
         c10::cuda::CUDACachingAllocator::raw_alloc(arr_size));
