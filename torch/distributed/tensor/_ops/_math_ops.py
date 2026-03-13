@@ -30,6 +30,7 @@ from torch.distributed.tensor._ops.utils import (
     normalize_dim,
     normalize_dims,
     register_op_strategy,
+    replicate_op_strategy,
 )
 from torch.distributed.tensor._utils import normalize_to_torch_size
 from torch.distributed.tensor.placement_types import (
@@ -1678,6 +1679,9 @@ def logsumexp_strategy(op_schema: OpSchema) -> OpStrategy:
     if not isinstance(input_strategy, OpStrategy):
         raise AssertionError(f"Expected OpStrategy, got {type(input_strategy)}")
 
+    if input_strategy.ndim == 0:
+        return cast(OpStrategy, replicate_op_strategy(op_schema))
+
     dims_arg = args_schema[1]
     reduce_dims = _infer_reduction_dims(dims_arg, input_strategy.ndim)
     if reduce_dims is None:
@@ -1866,6 +1870,18 @@ def linalg_cross_strategy(
             continue
         strategies.append([_ShardingPlaceholder(dim)] * 3)
     return strategies
+
+
+@register_single_dim_strategy(
+    [aten.linalg_tensorsolve.default],
+    schema_info=RuntimeSchemaInfo(1),
+)
+def linalg_tensorsolve_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    return []
 
 
 # ---------------------------------------------------------------------------
