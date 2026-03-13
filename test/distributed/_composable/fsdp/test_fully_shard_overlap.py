@@ -1,5 +1,6 @@
 # Owner(s): ["oncall: distributed"]
 
+import contextlib
 import copy
 import functools
 import unittest
@@ -9,6 +10,11 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp._fully_shard._fsdp_common import (
+    FSDPMeshInfo,
+    ShardPlacementResult,
+)
+from torch.distributed.tensor import init_device_mesh, Shard
 from torch.distributed.tensor.experimental import implicit_replication
 from torch.testing._internal.common_distributed import (
     skip_if_lt_x_gpu,
@@ -30,6 +36,74 @@ from torch.testing._internal.common_utils import (
 
 device_type = torch.device(get_devtype())
 device_module = torch.get_device_module(device_type)
+
+
+def _time_fn(fn: Callable):
+    start_event = device_module.Event(enable_timing=True)
+    end_event = device_module.Event(enable_timing=True)
+    dist.barrier()
+    device_module.synchronize()
+    start_event.record()
+    fn()
+    end_event.record()
+    device_module.synchronize()
+    return start_event.elapsed_time(end_event)
+
+
+def _median(times: list[float]) -> float:
+    times = sorted(times)
+    return times[len(times) // 2]
+
+
+@contextlib.contextmanager
+def _delayed_foreach_reduce(comm_sleep_ms: int):
+    """Wrap foreach_reduce to add per-PG delay via separate CUDA streams.
+
+    Each process group gets its own delay stream, so delays for different PGs
+    run in parallel.  The RS event returned to FSDP is replaced with a delayed
+    event, making the compute-stream wait (which differs between HEAD and
+    HEAD~1) the distinguishing factor.
+    """
+    import torch.distributed.fsdp._fully_shard._fsdp_param_group as _pg_mod
+
+    orig = _pg_mod.foreach_reduce
+    delay_streams: dict[dist.ProcessGroup, torch.cuda.Stream] = {}
+
+    def wrapped(
+        fsdp_params,
+        unsharded_grads,
+        reduce_scatter_group,
+        reduce_scatter_stream,
+        *args,
+        **kwargs,
+    ):
+        result = orig(
+            fsdp_params,
+            unsharded_grads,
+            reduce_scatter_group,
+            reduce_scatter_stream,
+            *args,
+            **kwargs,
+        )
+        rs_input, rs_event, *rest = result
+
+        if reduce_scatter_group not in delay_streams:
+            delay_streams[reduce_scatter_group] = device_module.Stream()
+        ds = delay_streams[reduce_scatter_group]
+        ds.wait_event(rs_event)
+        with device_module.stream(ds):
+            device_module._sleep(int(comm_sleep_ms * get_cycles_per_ms()))
+            delayed_event = ds.record_event()
+
+        return (rs_input, delayed_event, *rest)
+
+    dist.barrier()
+    _pg_mod.foreach_reduce = wrapped
+    try:
+        yield
+    finally:
+        dist.barrier()
+        _pg_mod.foreach_reduce = orig
 
 
 class TestFullyShardOverlap(FSDPTest):
@@ -276,6 +350,132 @@ class LinearWithSleep(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return nn.functional.relu(Matmul.apply(x, self.weight, self.sleep_ms))
+
+
+class DualParamLinearWithSleep(nn.Module):
+    """Module with two weights for testing per-param mesh overlap.
+
+    weight_a and weight_b can be routed to different FSDP param groups
+    via shard_placement_fn.
+    """
+
+    def __init__(self, dim: int, sleep_ms: int):
+        super().__init__()
+        self.weight_a = nn.Parameter(torch.randn((dim, dim)))
+        self.weight_b = nn.Parameter(torch.randn((dim, dim)))
+        self.sleep_ms = sleep_ms
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.functional.relu(
+            Matmul.apply(x, self.weight_a + self.weight_b, self.sleep_ms)
+        )
+
+
+class TestFullyShardPerParamMeshOverlap(FSDPTest):
+    @property
+    def world_size(self) -> int:
+        return min(8, torch.get_device_module(device_type).device_count())
+
+    @skip_if_rocm_arch_multiprocess(MI200_ARCH)
+    @skip_if_lt_x_gpu(8)
+    @unittest.skipIf(TEST_HPU, "Sleep is not supported on HPU")
+    def test_fully_shard_per_param_mesh_training_overlap(self):
+        """Test per-PG reduce-scatter state for per-param mesh FSDP.
+
+        With per-param mesh, each module has two param groups using different
+        process groups.  Per-PG reduce-scatter state (HEAD) lets peer param
+        group 0 skip the wait on the previous RS, while shared state (HEAD~1)
+        forces every param group to wait.  When comm_sleep > compute_sleep,
+        this extra wait on HEAD~1 adds exposed RS time to the critical path.
+
+        The delay is injected by wrapping ``foreach_reduce`` with per-PG delay
+        streams so that delays for different PGs run in parallel.
+        """
+        torch.manual_seed(42)
+
+        dim, num_modules = 8, 5
+        # comm >> compute so that HEAD~1's extra wait on peer 0 is exposed;
+        # large comm makes the signal overwhelm NCCL/scheduling noise
+        compute_sleep_ms, comm_sleep_ms = 25, 500
+        ep_degree = 2
+
+        efsdp_size = self.world_size // ep_degree
+        dp_mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("dp",),
+        )
+        sparse_mesh = dp_mesh._unflatten(
+            0,
+            (efsdp_size, ep_degree),
+            ("efsdp", "ep"),
+        )
+        dp_mesh_info = FSDPMeshInfo(mesh=dp_mesh, shard_mesh_dim=0)
+        efsdp_mesh_info = FSDPMeshInfo(mesh=sparse_mesh["efsdp"], shard_mesh_dim=0)
+
+        model = nn.Sequential(
+            *[
+                DualParamLinearWithSleep(dim, compute_sleep_ms)
+                for _ in range(num_modules)
+            ]
+        )
+
+        for mod in model:
+
+            def _shard_placement_fn(param, _mod=mod):
+                if param is _mod.weight_b:
+                    return ShardPlacementResult(
+                        placement=Shard(0), mesh_info=efsdp_mesh_info
+                    )
+                return ShardPlacementResult(placement=Shard(0), mesh_info=dp_mesh_info)
+
+            fully_shard(
+                mod,
+                mesh=dp_mesh,
+                reshard_after_forward=True,
+                shard_placement_fn=_shard_placement_fn,
+            )
+        fully_shard(model, mesh=dp_mesh, reshard_after_forward=True)
+
+        inp = torch.randn((2, dim), device=device_type.type)
+
+        def fwd_bwd():
+            model(inp).sum().backward()
+
+        # Warmup (many iterations to stabilize NCCL communicators)
+        for _ in range(10):
+            fwd_bwd()
+            model.zero_grad()
+
+        # Measure no-delay baseline
+        baseline_times = [_time_fn(fwd_bwd) for _ in range(5)]
+        for _ in range(5):
+            model.zero_grad()
+
+        # Measure with delayed reduce-scatter (per-PG delay streams)
+        with _delayed_foreach_reduce(comm_sleep_ms):
+            for _ in range(5):
+                fwd_bwd()
+                model.zero_grad()
+            delayed_times = [_time_fn(fwd_bwd) for _ in range(5)]
+            for _ in range(5):
+                model.zero_grad()
+
+        baseline = _median(baseline_times)
+        delayed = _median(delayed_times)
+        overhead = delayed - baseline
+        # 2 param groups * N modules * comm_sleep = total RS sleep injected
+        total_rs = 2 * num_modules * comm_sleep_ms
+        # With per-PG state (HEAD), only the last peer waits per module,
+        # giving overhead ~= (N+1)/(2N) * total_rs ~= 0.6.  With shared
+        # state (HEAD~1), peer 0 also waits on the previous module's RS,
+        # pushing overhead to ~0.9+.  The 0.75 threshold separates them.
+        self.assertLess(
+            overhead,
+            0.75 * total_rs,
+            f"RS overhead {overhead:.0f}ms >= 75% of total RS {total_rs}ms; "
+            f"per-PG RS state may not be preventing cross-PG stalls",
+        )
 
 
 if __name__ == "__main__":

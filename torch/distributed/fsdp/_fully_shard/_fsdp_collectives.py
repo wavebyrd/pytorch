@@ -514,6 +514,13 @@ def foreach_reduce(
 
     foreach_reduce_scatter_copy_in(unsharded_grads, reduce_scatter_input, world_size)
 
+    if device.index == 0:
+        print(
+            f"[RS-collective] input_numel={reduce_scatter_input_numel}"
+            f" output_numel={reduce_scatter_output_numel}"
+            f" dtype={reduce_dtype} world_size={world_size}"
+        )
+
     # Only after the copy-in finishes can we free the gradients
     unsharded_grads.clear()
     reduce_scatter_stream.wait_stream(current_stream)

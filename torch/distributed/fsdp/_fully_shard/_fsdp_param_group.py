@@ -93,7 +93,7 @@ class FSDPCommContext:
         # tensors produced in one stream and used in another and accompanying
         # CUDA events for synchronization
         self.all_gather_state: AllGatherState | None = None
-        self.reduce_scatter_state: ReduceScatterState | None = None
+        self.reduce_scatter_states: list[ReduceScatterState] = []
         # Post-forward order for explicit backward prefetching
         self.post_forward_order: list[FSDPParamGroup] = []  # will cause ref cycles
 
@@ -187,6 +187,8 @@ class FSDPParamGroup:
 
         # - Communication and communication/computation overlap
         self.comm_ctx = FSDPCommContext()
+        self._peer_param_group_index: int = 0
+        self._num_peer_param_groups: int = 1
         # Group's indices in the shared post-forward order
         self._post_forward_indices: list[int] = []
         # Whether to reduce gradients at all (whether for FSDP or HSDP)
@@ -487,6 +489,7 @@ class FSDPParamGroup:
             if default_prefetch:
                 self._backward_prefetch()
 
+
     @_dynamo_disable
     def post_backward(self, *unused: Any):
         # This method should be idempotent and safe to call even when this
@@ -524,15 +527,21 @@ class FSDPParamGroup:
                 self.reshard()
         if len(fsdp_params_with_grad) == 0:
             return
+        if self.device.index == 0:
+            grad_numel = sum(g.numel() for g in unsharded_grads)
+            print(
+                f"[RS] {self._module_fqn} peer={self._peer_param_group_index}"
+                f" ngrads={len(unsharded_grads)} numel={grad_numel}"
+            )
         with record_function(self._with_fqn("FSDP::post_backward_reduce")):
             if (
-                self.comm_ctx.reduce_scatter_state is not None
-                and self.comm_ctx.reduce_scatter_state.event is not None
+                self._peer_param_group_index == self._num_peer_param_groups - 1
+                and self.comm_ctx.reduce_scatter_states
             ):
-                self.device_handle.current_stream().wait_event(
-                    self.comm_ctx.reduce_scatter_state.event
-                )
-            self.comm_ctx.reduce_scatter_state = None
+                for rs_state in self.comm_ctx.reduce_scatter_states:
+                    if rs_state.event is not None:
+                        self.device_handle.current_stream().wait_event(rs_state.event)
+                self.comm_ctx.reduce_scatter_states.clear()
             all_reduce_pg = (
                 self._all_reduce_process_group
                 if isinstance(self.mesh_info, DDPMeshInfo)
@@ -584,8 +593,8 @@ class FSDPParamGroup:
                 self._all_reduce_hook,
                 self.force_sum_reduction_for_comms,
             )
-            self.comm_ctx.reduce_scatter_state = ReduceScatterState(
-                reduce_scatter_input, reduce_scatter_event
+            self.comm_ctx.reduce_scatter_states.append(
+                ReduceScatterState(reduce_scatter_input, reduce_scatter_event)
             )
             if all_reduce_input is not None:
                 if self.device.type != "cpu":
@@ -631,14 +640,16 @@ class FSDPParamGroup:
                 # Can be cleared if running multiple `backward`s
                 return
             curr_index = self._post_forward_indices.pop()
-            if (target_index := curr_index - 1) < 0:
-                return
-            # Prefetch naively using the reverse post-forward order, which may
-            # have mistargeted prefetches if not all modules used in forward
-            # are used in this backward
-            # pyrefly: ignore [unbound-name]
-            target_fsdp_param_group = self.comm_ctx.post_forward_order[target_index]
-            self._prefetch_unshard(target_fsdp_param_group, "backward")
+            # Prefetch using the reverse post-forward order. Walk back
+            # num_peers steps so that each peer skips past same-block
+            # peers (already unsharded) and prefetches peers in the
+            # previous block. Redundant prefetches are no-ops.
+            for step in range(1, self._num_peer_param_groups + 1):
+                target_index = curr_index - step
+                if target_index < 0:
+                    break
+                target = self.comm_ctx.post_forward_order[target_index]
+                self._prefetch_unshard(target, "backward")
 
     @staticmethod
     def _prefetch_unshard(

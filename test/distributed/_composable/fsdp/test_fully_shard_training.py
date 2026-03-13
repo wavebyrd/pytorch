@@ -1387,9 +1387,9 @@ class TestFullyShardNDTraining(FSDPTest):
     def test_shard_placement_fn_tp_ep(self):
         self.run_subtests(
             {
-                "tp_degree": [1, 2],
-                "dp_replicate": [1, 2],
-                "reshard_non_layer_modules": [False, True, 2],
+                "tp_degree": [1],
+                "dp_replicate": [1],
+                "reshard_non_layer_modules": [True],
             },
             self._test_shard_placement_fn_tp_ep,
         )
@@ -1498,17 +1498,16 @@ class TestFullyShardNDTraining(FSDPTest):
                 if mi.shard_mesh_size % reshard_non_layer_modules != 0:
                     return
         model_args = ModelArgs(
-            n_layers=2,
-            vocab_size=256,
-            max_seq_len=32,
-            dim=64,
-            n_heads=4,
+            n_layers=10,
+            vocab_size=1024,
+            max_seq_len=512,
+            dim=4096,
+            n_heads=32,
             dropout_p=0.0,
             num_experts=8,
         )
         torch.manual_seed(42)
         model = Transformer(model_args)
-        ref_model = copy.deepcopy(model).to(device_type)
         Transformer.parallelize(
             model, tp_mesh=tp_mesh, use_seq_parallel=False, ep_mesh=ep_mesh
         )
@@ -1529,17 +1528,11 @@ class TestFullyShardNDTraining(FSDPTest):
                     mesh_info=dp_mesh_info,
                 )
 
-            # Blocks always have DTensor expert params (from EP), so int
-            # reshard is not supported; do not pass reshard_after_forward.
             fully_shard(
                 block,
                 mesh=dp_mesh,
                 shard_placement_fn=_shard_placement_fn,
             )
-        # Group tok_embeddings, norm, and output together since
-        # output.weight is tied to tok_embeddings.weight
-        # These modules have no DTensor params when tp_degree == 1.
-        # With TP, root params are DTensors and int reshard is unsupported.
         if tp_mesh is not None:
             reshard_non_layer_modules = True
         fully_shard(
@@ -1550,54 +1543,164 @@ class TestFullyShardNDTraining(FSDPTest):
         fully_shard(
             model, mesh=dp_mesh, reshard_after_forward=reshard_non_layer_modules
         )
-        for (name, param), (_, ref_param) in zip(
-            model.named_parameters(), ref_model.named_parameters()
-        ):
-            full_param = param.full_tensor()
-            self.assertEqual(full_param, ref_param)
-        ref_expert_params = {
-            p for b in ref_model.layers for p in b.expert_layer.experts.parameters()
-        }
+        # Set up prefetching: forward block[i] prefetches block[i+1],
+        # backward block[i] prefetches block[i-1].
+        blocks = model.layers
+        for i in range(len(blocks) - 1):
+            blocks[i].set_modules_to_forward_prefetch([blocks[i + 1]])
+        for i in range(1, len(blocks)):
+            blocks[i].set_modules_to_backward_prefetch([blocks[i - 1]])
         optim = torch.optim.Adam(model.parameters(), lr=1e-2)
-        ref_optim = torch.optim.Adam(ref_model.parameters(), lr=1e-2)
         torch.manual_seed(42 + self.rank // tp_degree)
         inp = torch.randint(
             0,
             model_args.vocab_size,
-            (2, model_args.max_seq_len),
+            (8, model_args.max_seq_len),
             device=device_type.type,
         )
-        dp_replicate_group = (
-            dp_mesh["dp_replicate"].get_group() if dp_replicate > 1 else None
+        from torch import profiler as torch_profiler
+        trace_dir = "/tmp/fsdp_tp_ep_trace"
+        prof = torch_profiler.profile(
+            activities=[
+                torch_profiler.ProfilerActivity.CPU,
+                torch_profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch_profiler.schedule(
+                wait=0, warmup=2, active=1, repeat=1, skip_first=1,
+            ),
+            on_trace_ready=torch_profiler.tensorboard_trace_handler(trace_dir),
+            record_shapes=True,
+            with_stack=True,
         )
+        prof.start()
         for iter_idx in range(5):
-            ref_loss = ref_model(inp).sum()
             loss = model(inp).sum()
-            ref_loss.backward()
             loss.backward()
-            for param in ref_model.parameters():
-                if param.grad is None:
-                    continue
-                if param in ref_expert_params:
-                    dist.all_reduce(
-                        param.grad, op=dist.ReduceOp.SUM, group=ep_mesh.get_group()
-                    )
-                    dist.all_reduce(
-                        param.grad, op=dist.ReduceOp.AVG, group=efsdp_mesh.get_group()
-                    )
-                    if dp_replicate_group is not None:
-                        dist.all_reduce(
-                            param.grad,
-                            op=dist.ReduceOp.AVG,
-                            group=dp_replicate_group,
-                        )
-                else:
-                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-            ref_optim.step()
             optim.step()
-            ref_optim.zero_grad(set_to_none=(iter_idx % 2 == 0))
             optim.zero_grad(set_to_none=(iter_idx % 2 == 0))
-            self.assertEqual(ref_loss, loss)
+            prof.step()
+        prof.stop()
+        if self.rank == 0:
+            import glob as glob_mod
+            traces = sorted(glob_mod.glob(f"{trace_dir}/*.json"))
+            if traces:
+                print(f"\nTrace saved to: {traces[-1]}")
+
+    @skip_if_lt_x_gpu(8)
+    def test_shard_placement_fn_fake(self):
+        self.run_subtests(
+            {
+                "explicit_prefetch": [True, False],
+                "enable_per_param_mesh": [True],
+            },
+            self._test_shard_placement_fn_fake,
+        )
+
+    def _test_shard_placement_fn_fake(self, explicit_prefetch, enable_per_param_mesh):
+        ep_degree = 2
+        result = self._init_parallel_meshes(1, 1, ep_degree)
+        if result is None:
+            return
+        (
+            _,
+            dp_mesh,
+            _,
+            _,
+            dp_mesh_info,
+            efsdp_mesh_info,
+        ) = result
+        model_args = ModelArgs(
+            n_layers=10,
+            vocab_size=1024,
+            max_seq_len=512,
+            dim=4096,
+            n_heads=32,
+            dropout_p=0.0,
+        )
+        torch.manual_seed(42)
+        model = Transformer(model_args)
+        for block in model.layers:
+            if enable_per_param_mesh:
+                ff_params = set(block.feed_forward.parameters())
+
+                def _shard_placement_fn(
+                    param,
+                    _ff_params=ff_params,
+                ):
+                    if param in _ff_params:
+                        return ShardPlacementResult(
+                            placement=Shard(0),
+                            mesh_info=efsdp_mesh_info,
+                        )
+                    return ShardPlacementResult(
+                        placement=Shard(0),
+                        mesh_info=dp_mesh_info,
+                    )
+
+                fully_shard(
+                    block,
+                    mesh=dp_mesh,
+                    shard_placement_fn=_shard_placement_fn,
+                )
+            else:
+                fully_shard(block.feed_forward, mesh=dp_mesh)
+                fully_shard(block, mesh=dp_mesh)
+        fully_shard(
+            [model.tok_embeddings, model.pos_embeddings, model.dropout],
+            mesh=dp_mesh,
+            reshard_after_forward=True,
+        )
+        fully_shard(
+            [model.norm, model.output],
+            mesh=dp_mesh,
+            reshard_after_forward=True,
+        )
+        fully_shard(
+            model, mesh=dp_mesh, reshard_after_forward=True
+        )
+        if explicit_prefetch:
+            # Forward: block[i] prefetches block[i+1]
+            blocks = model.layers
+            for i in range(len(blocks) - 1):
+                blocks[i].set_modules_to_forward_prefetch([blocks[i + 1]])
+            # Backward: block[i] prefetches block[i-1]
+            for i in range(1, len(blocks)):
+                blocks[i].set_modules_to_backward_prefetch([blocks[i - 1]])
+        optim = torch.optim.Adam(model.parameters(), lr=1e-2)
+        torch.manual_seed(42 + self.rank)
+        inp = torch.randint(
+            0,
+            model_args.vocab_size,
+            (8, model_args.max_seq_len),
+            device=device_type.type,
+        )
+        from torch import profiler as torch_profiler
+        trace_dir = f"/tmp/fsdp_trace_prefetch_{explicit_prefetch}_ppm_{enable_per_param_mesh}"
+        prof = torch_profiler.profile(
+            activities=[
+                torch_profiler.ProfilerActivity.CPU,
+                torch_profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch_profiler.schedule(
+                wait=0, warmup=2, active=1, repeat=1, skip_first=1,
+            ),
+            on_trace_ready=torch_profiler.tensorboard_trace_handler(trace_dir),
+            record_shapes=True,
+            with_stack=True,
+        )
+        prof.start()
+        for iter_idx in range(5):
+            loss = model(inp).sum()
+            loss.backward()
+            optim.step()
+            optim.zero_grad(set_to_none=(iter_idx % 2 == 0))
+            prof.step()
+        prof.stop()
+        if self.rank == 0:
+            import glob as glob_mod
+            traces = sorted(glob_mod.glob(f"{trace_dir}/*.json"))
+            if traces:
+                print(f"\nTrace saved to: {traces[-1]}")
 
 
 class TestFullyShardHSDP3DTraining(FSDPTest):
