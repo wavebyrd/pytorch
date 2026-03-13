@@ -1746,11 +1746,11 @@ def speculate_subgraph_with_auto_output_flattening(
             # nested_compile_region and autograd.Function. Today, its safe
             # because we error out on seeing a side-effect.
 
-            allow_side_effects = (
-                allow_side_effects
+            has_side_effects = (
+                subtracer.side_effect_stack is not None
                 or tx.output.current_tracer.traced_with_externally_visible_side_effects
             )
-            if allow_side_effects:
+            if allow_side_effects and has_side_effects:
                 extra_outputs = collect_intermediate_outputs(
                     tx, subtracer, graph_output_vts, filter_aliased_intermediates
                 )
