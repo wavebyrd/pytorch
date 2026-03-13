@@ -3455,6 +3455,7 @@ def handle_traced_output(
             torch._C._get_mem_efficient_sdp_enabled,
             torch._C._get_math_sdp_enabled,
             torch._C._get_overrideable_sdp_enabled,
+            torch._C._is_autocast_available,
             "is_integer",
         ]
         + list(supported_const_comparison_op_values.keys())
