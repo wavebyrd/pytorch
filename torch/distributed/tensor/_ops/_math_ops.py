@@ -1974,3 +1974,64 @@ def grid_sampler_2d_backward_strategy(
 ) -> list[list[Placement | _ShardingPlaceholder]]:
     # 2 outputs (grad_input, grad_grid) + 3 inputs = 5 placements, batch-only
     return [[_ShardingPlaceholder(0)] * 5]
+
+
+# ---------------------------------------------------------------------------
+# Normalization ops
+#
+# Batch norm reduces over batch (dim 0) + spatial dims (2+), keeping only
+# channel (dim 1).  Neither batch nor channel sharding is safe, so we fall
+# back to replicate-only.
+#
+# Group norm reduces over (C/groups, spatial) within each group per sample.
+# Batch dim (0) is safe to shard — each sample is independent.
+# ---------------------------------------------------------------------------
+
+BATCH_NORM_3OUT_OPS = [
+    aten.native_batch_norm.default,
+    aten._native_batch_norm_legit.default,
+    aten._native_batch_norm_legit.no_stats,
+    aten._native_batch_norm_legit_no_training.default,
+]
+
+BATCH_NORM_4OUT_OPS = [
+    aten._batch_norm_with_update.default,
+]
+
+
+@register_op_strategy(
+    BATCH_NORM_3OUT_OPS + BATCH_NORM_4OUT_OPS,
+    schema_info=RuntimeSchemaInfo(1),
+)
+def batch_norm_strategy(op_schema: OpSchema) -> OpStrategy:
+    """Batch norm reduces over batch + spatial dims, so replicate all."""
+    input_strategy = cast(OpStrategy, op_schema.args_schema[0])
+    mesh = input_strategy.mesh
+    num_outputs = 4 if op_schema.op in BATCH_NORM_4OUT_OPS else 3
+    num_inputs = len(op_schema.args_strategy) + len(op_schema.kwargs_strategy)
+    n = num_outputs + num_inputs
+    single_mesh_dim_strategies: list[PlacementList] = [
+        [Replicate()] * n,
+    ]
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=num_outputs
+    )
+
+
+@register_single_dim_strategy(
+    [aten.native_group_norm.default],
+    schema_info=RuntimeSchemaInfo(1),
+)
+def group_norm_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    # native_group_norm(input, weight?, bias?, N, C, HxW, group, eps) -> (T, T, T)
+    # Batch dim (0) is safe; weight/bias have shape (C,) with no batch dim.
+    num_tensor_inputs = sum(isinstance(a, TensorMeta) for a in args_schema)
+    # 3 outputs + input all shard on batch dim
+    placements: list[Placement | _ShardingPlaceholder] = [_ShardingPlaceholder(0)] * 4
+    # weight and bias (if present) must be Replicate
+    placements.extend([Replicate()] * (num_tensor_inputs - 1))
+    return [placements]

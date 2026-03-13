@@ -209,8 +209,12 @@ dtensor_fails = {
     xfail("sparse.mm", "reduce"),
     # bug in squeeze.dims strategy: TypeError with empty dims arg
     xfail("squeeze", "multiple"),
+    # group_norm: sharding passes wrong N/HxW scalars to native_group_norm
+    xfail("nn.functional.group_norm"),
     # interpolation ops: Partial strategy triggers errors during sharding prop
     xfail("nn.functional.grid_sample"),
+    # instance_norm decomposes to group_norm → same N/HxW mismatch
+    xfail("nn.functional.instance_norm"),
     # meta tensor data not allocated yet during tensor_split
     xfail("tensor_split"),
     # output_specs count mismatch in unsafe_split strategy
@@ -377,9 +381,7 @@ dtensor_numeric_only_fails = {
 # Ops in dtensor_fails that have no sharding strategy (NotImplementedError).
 # These will error during sharding propagation and affect unbacked tests too.
 dtensor_fails_no_strategy = {
-    xfail("_batch_norm_with_update"),
     xfail("_chunk_cat"),
-    xfail("_native_batch_norm_legit"),
     xfail("_unsafe_masked_index"),
     xfail("_unsafe_masked_index_put_accumulate"),
     xfail("addbmm"),
@@ -414,12 +416,8 @@ dtensor_fails_no_strategy = {
     xfail("masked_scatter"),
     xfail("multinomial"),
     xfail("nanquantile"),
-    xfail("native_batch_norm"),
-    xfail("nn.functional.batch_norm"),
     xfail("nn.functional.bilinear"),
-    xfail("nn.functional.group_norm"),
     xfail("nn.functional.hardshrink"),
-    xfail("nn.functional.instance_norm"),
     xfail("nn.functional.multi_margin_loss"),
     xfail("nn.functional.multilabel_margin_loss"),
     xfail("nn.functional.pad", "reflect"),
